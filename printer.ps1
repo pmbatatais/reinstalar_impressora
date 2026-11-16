@@ -41,6 +41,15 @@ function Test-NomeResolve {
     try { [void][System.Net.Dns]::GetHostAddresses($Nome); return $true } catch { return $false }
 }
 
+function Test-Porta9100 {
+    param([string]$IP)
+    $c = New-Object System.Net.Sockets.TcpClient
+    try {
+        $t = $c.ConnectAsync($IP, 9100)
+        return ($t.Wait(1500) -and $c.Connected)
+    } catch { return $false } finally { $c.Dispose() }
+}
+
 # Marca pela impressora (driver + nome), mesmo que o nome tenha sido trocado
 function Get-MarcaImpressora {
     param($Imp)
@@ -92,15 +101,16 @@ function Get-ImpressorasNaRede {
 
         if ($nome -match '^BRW') { $marca = 'Brother' }
         elseif ($nome -match '^SEC') { $marca = 'Samsung' }
-        else {
-            # Sem nome útil: descobre a marca pela página web e monta o nome pelo MAC
-            $marca = Get-MarcaPorHttp -IP $ip
+        if (-not $marca) { $marca = Get-MarcaPorHttp -IP $ip }
+
+        # Só monta o nome pelo MAC se o aparelho não tiver nenhum nome
+        if (-not $nome -and $marca) {
             $mac = (Get-NetNeighbor -IPAddress $ip -ErrorAction SilentlyContinue | Where-Object LinkLayerAddress | Select-Object -First 1).LinkLayerAddress
-            if ($marca -and $mac) {
+            if ($mac) {
                 $pre = if ($marca -eq 'Brother') { 'BRW' } else { 'SEC' }
                 $nome = $pre + ($mac -replace '[-:]', '').ToUpper()
                 $origem = 'montado pelo MAC'
-            } else { $nome = $null }
+            }
         }
         $achadas.Add([PSCustomObject]@{ IP = $ip; Nome = $nome; Marca = $marca; Origem = $origem })
     }
@@ -118,6 +128,19 @@ $wsdPorts = @{}
 Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\WSD Port\Ports\*" -ErrorAction SilentlyContinue | ForEach-Object { $wsdPorts[$_.PSChildName] = $_ }
 
 # --------------------------------------------------------------- Principal ----
+
+# Nós já em uso por filas que usam nome (por marca): servem de pista para as demais filas
+$conhecidos = @{}
+foreach ($x in (Get-Printer)) {
+    $pp = Get-PrinterPort -Name $x.PortName -ErrorAction SilentlyContinue
+    if ($pp.PrinterHostAddress -and -not (Test-EhIPv4 $pp.PrinterHostAddress)) {
+        $mx = Get-MarcaImpressora -Imp $x
+        if ($mx) {
+            if (-not $conhecidos.ContainsKey($mx.Marca)) { $conhecidos[$mx.Marca] = @() }
+            if ($conhecidos[$mx.Marca] -notcontains $pp.PrinterHostAddress) { $conhecidos[$mx.Marca] += $pp.PrinterHostAddress }
+        }
+    }
+}
 
 $resultado = New-Object System.Collections.Generic.List[object]
 $portasAntigas = New-Object System.Collections.Generic.HashSet[string]
@@ -159,16 +182,26 @@ foreach ($imp in (Get-Printer -Name $FiltroNome)) {
 
         # 1) Mapa manual tem prioridade
         if ($Manual.ContainsKey($imp.Name)) { $nome = $Manual[$imp.Name]; $origemNome = 'manual' }
-        # 2) Descarta nome que não combina com a marca (ex.: IP antigo agora é de outro aparelho)
-        elseif ($nome -and $m -and $nome -notmatch "^$($m.Prefixo)") {
-            Write-Host "  [$($imp.Name)] nome '$nome' no IP antigo não parece ser da impressora; ignorando." -ForegroundColor DarkYellow
+        # 2) Nome achado no IP antigo: só vale se o aparelho for mesmo uma impressora
+        #    (porta 9100 aberta) ou, com ele desligado, se o nome combinar com a marca
+        elseif ($nome -and $ip -and -not (Test-Porta9100 $ip) -and -not ($m -and $nome -match "^($($m.Prefixo)|SEC|BRW)")) {
+            Write-Host "  [$($imp.Name)] '$nome' no IP antigo ($ip) não parece ser uma impressora; ignorando." -ForegroundColor DarkYellow
             $nome = $null
+        }
+
+        # 2b) Outra fila da mesma marca já usa um nó: se for um só, é o mesmo aparelho
+        if (-not $nome -and $m -and $conhecidos[$m.Marca] -and @($conhecidos[$m.Marca]).Count -eq 1) {
+            $nome = @($conhecidos[$m.Marca])[0]; $origemNome = 'mesmo nó de outra fila'
         }
 
         # 3) Procura na rede pela marca
         if (-not $nome -and $BuscarNaRede -and $m) {
             if ($null -eq $descobertas) { $descobertas = @(Get-ImpressorasNaRede) }
             $cands = @($descobertas | Where-Object { $_.Marca -eq $m.Marca -and $_.Nome })
+            if ($cands.Count -gt 1 -and $conhecidos[$m.Marca]) {
+                $pref = @($cands | Where-Object { $conhecidos[$m.Marca] -contains $_.Nome })
+                if ($pref.Count -eq 1) { $cands = $pref }
+            }
             if ($cands.Count -eq 1) { $nome = $cands[0].Nome; $ip = $cands[0].IP; $origemNome = "achada na rede ($($cands[0].Origem))" }
             elseif ($cands.Count -gt 1) {
                 $status = "Ignorada: $($cands.Count) impressoras $($m.Marca) na rede ($(($cands.Nome) -join ', ')); use o mapa `$Manual"
