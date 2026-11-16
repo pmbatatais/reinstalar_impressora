@@ -119,5 +119,3 @@ if (-not $Simular -and $RemoverPortaAntiga) {
 
 Write-Host ""
 $resultado | Format-Table Impressora, TipoPorta, EnderecoIP, NomeDoNo, PortaAntiga, PortaNova -AutoSize
-$resultado | Export-Csv -Path $logCsv -NoTypeInformation -Encoding UTF8
-Write-Host "Log salvo em: $logCsv" -ForegroundColor Cyan
