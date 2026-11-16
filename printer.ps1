@@ -31,6 +31,8 @@ $wsdPorts = @{}
 Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\WSD Port\Ports\*" -ErrorAction SilentlyContinue | ForEach-Object { $wsdPorts[$_.PSChildName] = $_ }
 
 $pasta  = [Environment]::GetFolderPath('Desktop')
+if (-not $pasta) { $pasta = $env:TEMP }
+if (-not $pasta) { $pasta = (Get-Location).Path }
 $logCsv = Join-Path $pasta ("MigracaoPortas_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 $resultado = New-Object System.Collections.Generic.List[object]
 $portasAntigas = New-Object System.Collections.Generic.HashSet[string]
