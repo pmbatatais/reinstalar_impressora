@@ -37,6 +37,17 @@ function Get-NomeNetBios {
     return $null
 }
 
+function Get-MacViaSnmp {
+    param([string]$IP, [string]$Com)
+    # ifPhysAddress.1 (primeira interface)
+    $mac = Get-Snmp -IP $IP -Oid '1.3.6.1.2.1.2.2.1.6.1' -Comunidade $Com
+    if ($mac) {
+        # Retorna como string hex se vier em octetos — ajuste conforme o retorno do seu Get-Snmp
+        return ($mac -replace '[^0-9A-Fa-f]', '').ToUpper()
+    }
+    return $null
+}
+
 function Get-NomeDoNoPorIP {
     param([string]$IP)
     $dns = (Resolve-DnsName -Name $IP -Type PTR -ErrorAction SilentlyContinue).NameHost
@@ -111,17 +122,30 @@ function Get-MarcaImpressora {
 }
 
 # $true = modelo do driver aparece no texto do aparelho; $false = não aparece; $null = não dá para saber
+# $true = modelo do driver aparece no texto; $false = não aparece; $null = não dá para decidir
 function Test-ModeloCombina {
     param([string]$Driver, [string]$TextoNorm)
     if (-not $Driver -or -not $TextoNorm) { return $null }
-    $tokens = @([regex]::Matches($Driver, '[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*') | ForEach-Object { $_.Value } |
-        Where-Object { $_.Length -ge 3 -and $_ -notmatch '^(PCL\d*|PS\d*|XPS|v\d+)$' })
+
+    # Tokens candidatos: pega só padrões "letra+número" típicos de modelo
+    # Ex.: HL-L2350DW, M337x, MFC-J6935DW, iR-ADV C5535, ECOSYS M3655idn
+    $tokens = @(
+        [regex]::Matches($Driver, '(?i)\b([A-Z]{1,5}[- ]?[A-Z]{0,3}[- ]?\d{2,5}[A-Za-z]{0,3})\b') |
+            ForEach-Object { $_.Value } |
+            ForEach-Object { $_ -replace '[\s\-]', '' } |
+            Where-Object { $_.Length -ge 3 -and $_ -notmatch '^(PCL\d*|PS\d*|XPS|v\d+)$' } |
+            Select-Object -Unique
+    )
     if ($tokens.Count -eq 0) { return $null }
+
     foreach ($tok in $tokens) {
-        $t = ($tok -replace '[^A-Za-z0-9]', '')
-        if ($tok -cmatch 'x$') { $re = [regex]::Escape($t.Substring(0, $t.Length - 1).ToUpper()) + '[A-Z0-9]' }   # "M337x" -> M337?
-        else { $re = [regex]::Escape($t.ToUpper()) }
-        if ($TextoNorm -match $re) { return $true }
+        $t = $tok.ToUpper()
+        # Trata variantes tipo "M337x" -> M337? (sufixo x indica família)
+        if ($t -cmatch 'X$' -and $t.Length -ge 4) {
+            $base = $t.Substring(0, $t.Length - 1)
+            if ($TextoNorm -match [regex]::Escape($base)) { return $true }
+        }
+        if ($TextoNorm -match [regex]::Escape($t)) { return $true }
     }
     return $false
 }
@@ -207,13 +231,29 @@ function Get-Identidade {
         if ($d) { $id.Descr = [string]$d; $id.Snmp = $true; $com = $c; break }
     }
     if ($id.Snmp) {
-        $id.Vivo = $true
-        $s = Get-Snmp -IP $IP -Oid '1.3.6.1.2.1.43.5.1.1.17.1' -Comunidade $com
-        if (-not $s -and $id.Descr -match 'S/N\s+([A-Za-z0-9]+)') { $s = $Matches[1] }
-        if ($s -and ([string]$s).Trim().Length -ge 4) { $id.Serie = ([string]$s).Trim().ToUpper() }
-        $id.Modelo  = Get-Snmp -IP $IP -Oid '1.3.6.1.2.1.25.3.2.1.3.1' -Comunidade $com
-        $id.SysName = Get-Snmp -IP $IP -Oid '1.3.6.1.2.1.1.5.0' -Comunidade $com
-    }
+				$id.Vivo = $true
+				# ... (série como já está)
+
+				# Modelo: tenta vários OIDs, o primeiro que responder preenche
+				$modeloOids = @(
+						'1.3.6.1.2.1.25.3.2.1.3.1',       # hrDeviceDescr
+						'1.3.6.1.2.1.43.5.1.1.16.1',      # prtGeneralPrinterName
+						'1.3.6.1.2.1.1.1.0'               # sysDescr (fallback)
+				)
+				foreach ($oidM in $modeloOids) {
+						$mm = Get-Snmp -IP $IP -Oid $oidM -Comunidade $com
+						if ($mm) { $id.Modelo = [string]$mm; break }
+				}
+
+				$id.SysName = Get-Snmp -IP $IP -Oid '1.3.6.1.2.1.1.5.0' -Comunidade $com
+
+				# Alguns aparelhos expõem modelo em prtGeneralPrinterName por índice;
+				# se o índice 1 não responde, tenta 0
+				if (-not $id.Modelo) {
+						$mm = Get-Snmp -IP $IP -Oid '1.3.6.1.2.1.43.5.1.1.16.0' -Comunidade $com
+						if ($mm) { $id.Modelo = [string]$mm }
+				}
+		}
     else {
         # Sem SNMP: considera "vivo" se alguma porta de impressão abrir
         foreach ($pt in 9100, 515, 631) { if (Test-Porta -Alvo $IP -Porta $pt -TimeoutMs 800) { $id.Vivo = $true; break } }
@@ -222,8 +262,9 @@ function Get-Identidade {
 
     $id.Mac  = Get-MacPorIP -IP $IP
     $id.Nome = Get-NomeDoNoPorIP -IP $IP
-    $txt = "$($id.Modelo) $($id.Descr)"
+    $txt = "$($id.Modelo) $($id.Descr) $($id.SysName)"
     if (-not $id.Snmp) { $web = Get-PaginaWeb -IP $IP; if ($web) { $txt = "$txt $web" } }
+		if (-not $id.Mac -and $id.Snmp) { $id.Mac = Get-MacViaSnmp -IP $IP -Com $com }
     $id.Marca = Get-MarcaPorTexto -Texto $txt
     $n = ($txt -replace '[^A-Za-z0-9]', '').ToUpper()
     if ($n.Length -gt 40000) { $n = $n.Substring(0, 40000) }
@@ -560,7 +601,10 @@ foreach ($f in $filas) {
         if ($tipo -eq 'TCP/IP (já usa nome)') { $status = 'Ignorada: já usa nome do nó' }
         else {
             $bloqueioMotivo = $null; $motivoFalha = $null
-            $reservaLiberada = ($m -and [int]$qtdDisp[$m] -le 1)
+            # Reserva liberada se:
+						#  - há só 1 aparelho dessa marca, OU
+						#  - esta fila tem inventário (série/MAC) que permita confirmar identidade
+						$reservaLiberada = ($m -and ([int]$qtdDisp[$m] -le 1 -or ($inv -and ($inv.Serie -or $inv.Mac))))
 
             # 1) Mapa manual
             if ($Manual.ContainsKey($imp.Name)) {
@@ -594,37 +638,89 @@ foreach ($f in $filas) {
             if (-not $nome -and -not $bloqueioMotivo -and $reservaLiberada) {
                 # 4a) outra fila da mesma marca já usa um nó: é o mesmo aparelho
                 if ($conhecidos[$m] -and @($conhecidos[$m]).Count -eq 1) {
-                    $cand = @($conhecidos[$m])[0]
-                    $ipc = Get-IPdoNome -Nome $cand
-                    if ($ipc) { $nome = $cand; $origemNome = 'mesmo nó de outra fila'; $dev = Get-IdentidadeCache -IP $ipc }
-                }
+										$cand = @($conhecidos[$m])[0]
+										$ipc  = Get-IPdoNome -Nome $cand
+										if ($ipc) {
+												$devc = Get-IdentidadeCache -IP $ipc
+												$mesmo = $false
+												if ($inv -and $devc) {
+														if ($inv.Serie -and $devc.Serie -and $inv.Serie -eq $devc.Serie) { $mesmo = $true }
+														elseif ($inv.Mac -and $devc.Mac -and $inv.Mac -eq $devc.Mac)     { $mesmo = $true }
+												}
+												if ($mesmo) { $nome = $cand; $origemNome = 'mesmo nó de outra fila (série/MAC confirmado)'; $dev = $devc }
+										}
+								}
                 # 4b) procura na rede por marca (e modelo, se houver mais de um)
-                if (-not $nome -and $BuscarNaRede) {
-                    if ($null -eq $descobertas) { $descobertas = @(Get-ImpressorasNaRede) }
-                    $cands = @($descobertas | Where-Object {
-                        $_.Marca -eq $m -and -not ($_.Serie -and $inv.Serie -and $_.Serie -ne $inv.Serie) })
-                    if ($cands.Count -gt 1) {
-                        $porModelo = @($cands | Where-Object { (Test-ModeloCombina -Driver $imp.DriverName -TextoNorm $_.Texto) -eq $true })
-                        if ($porModelo.Count -ge 1) { $cands = $porModelo }
-                    }
-                    if ($cands.Count -eq 1) {
-                        $n4 = Select-NomeValido -Dev $cands[0]
-                        if ($n4) {
-                            $mod = Test-ModeloCombina -Driver $imp.DriverName -TextoNorm $cands[0].Texto
-                            $obs = if ($mod -eq $true) { 'modelo confirmado' } elseif ($mod -eq $false) { 'modelo NÃO confirmado' } else { 'modelo não verificável' }
-                            $nome = $n4; $dev = $cands[0]; $origemNome = "achada na rede por marca ($obs)"
-                        }
-                        else { $motivoFalha = "achei uma $m em $($cands[0].IP), mas nenhum nome dela resolve para esse IP" }
-                    }
-                    elseif ($cands.Count -gt 1) { $motivoFalha = "$($cands.Count) impressoras $m na rede ($(($cands.IP) -join ', ')); sem como escolher sozinho" }
-                    else { $motivoFalha = "nenhuma impressora $m encontrada na rede" }
-                }
-            }
+                if (-not $nome -and -not $bloqueioMotivo -and $BuscarNaRede) {
+									if ($null -eq $descobertas) { $descobertas = @(Get-ImpressorasNaRede) }
+
+									# Candidatos da mesma marca
+									$cands = @($descobertas | Where-Object { $_.Marca -eq $m })
+
+									# 1) Match exato por série/MAC do inventário
+									if ($inv) {
+											if ($inv.Serie) {
+													$exato = @($cands | Where-Object { $_.Serie -eq $inv.Serie })
+													if ($exato.Count -eq 1) {
+															$n4 = Select-NomeValido -Dev $exato[0]
+															if ($n4) { $nome = $n4; $dev = $exato[0]; $origemNome = 'inventário: série exata na rede' }
+															else { $motivoFalha = "achei o aparelho por série em $($exato[0].IP), mas nenhum nome resolve para ele" }
+													}
+											}
+											if (-not $nome -and $inv.Mac) {
+													$exato = @($cands | Where-Object { $_.Mac -eq $inv.Mac })
+													if ($exato.Count -eq 1) {
+															$n4 = Select-NomeValido -Dev $exato[0]
+															if ($n4) { $nome = $n4; $dev = $exato[0]; $origemNome = 'inventário: MAC exato na rede' }
+													}
+											}
+									}
+
+									# 2) Ranking por modelo (pontuação)
+									if (-not $nome -and $cands.Count -ge 1) {
+											$pontuados = @($cands | ForEach-Object {
+													$mod = Test-ModeloCombina -Driver $imp.DriverName -TextoNorm $_.Texto
+													$pts = 0
+													if ($mod -eq $true)  { $pts += 100 }
+													if ($mod -eq $false) { $pts -= 50 }
+													if ($_.Snmp)         { $pts += 10 }
+													if ($_.Serie)        { $pts += 5 }
+													[PSCustomObject]@{ Dev = $_; Pts = $pts; Mod = $mod }
+											} | Sort-Object Pts -Descending)
+
+											# Só decide se houver um vencedor claro
+											if ($pontuados.Count -eq 1 -or ($pontuados[0].Pts - $pontuados[1].Pts) -ge 50) {
+													$vencedor = $pontuados[0]
+													$n4 = Select-NomeValido -Dev $vencedor.Dev
+													if ($n4) {
+															$obs = switch ($vencedor.Mod) { $true {'modelo confirmado'} $false {'modelo NÃO confirmado'} default {'modelo não verificável'} }
+															$nome = $n4; $dev = $vencedor.Dev
+															$origemNome = "ranking por modelo ($obs, score $($vencedor.Pts))"
+													}
+											}
+											elseif ($cands.Count -gt 1) {
+													$motivoFalha = "$($cands.Count) impressoras $m na rede e o modelo não permitiu desempate; use o modo assistido"
+											}
+									}
+									else {
+											$motivoFalha = "nenhuma impressora $m encontrada na rede"
+									}
+							}
+						
+						}
 
             # 5) Modo assistido: pergunta no terminal (só interativo e fora da simulação)
             if (-not $nome -and -not $bloqueioMotivo -and $ModoAssistido -and $BuscarNaRede -and -not $Simular -and $Host.Name -match 'ConsoleHost|ISE') {
                 if ($null -eq $descobertas) { $descobertas = @(Get-ImpressorasNaRede) }
-                $cands5 = @($descobertas | Where-Object { ($_.Snmp -or $_.Marca) -and (-not $m -or -not $_.Marca -or $_.Marca -eq $m) })
+                $cands5 = @($descobertas | Where-Object {
+										($_.Snmp -or $_.Marca) -and
+										(-not $m -or -not $_.Marca -or $_.Marca -eq $m)
+								})
+								# Ordena: primeiro os que o driver parece confirmar
+								$cands5 = @($cands5 | Sort-Object -Property @{
+										Expression = { (Test-ModeloCombina -Driver $imp.DriverName -TextoNorm $_.Texto) -eq $true }
+										Descending = $true
+								})
                 $esc = Invoke-Assistido -Fila $f -Cands $cands5
                 if ($esc) {
                     $n5 = Select-NomeValido -Dev $esc
